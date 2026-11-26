@@ -397,7 +397,7 @@ def create_app(
         input_path = job_manager.job_dir(job_id) / f"input_{Path(orig_name).name}"
         await _save_upload_with_limit(file, input_path, max_bytes=cfg.max_upload_bytes)
 
-        state = job_manager.register_job(
+        state = await job_manager.register_job_async(
             job_id=job_id,
             input_path=input_path,
             original_filename=orig_name,
@@ -422,7 +422,7 @@ def create_app(
         summary="Get current status, percentage, and telemetry for a conversion job",
     )
     async def get_job_status(job_id: str) -> JobStatusResponse:
-        status = job_manager.get_job_status(job_id)
+        status = await job_manager.get_job_status_async(job_id)
         if status is None:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
         return status
@@ -453,7 +453,7 @@ def create_app(
             description="Wire format for progress events: 'sse' (Server-Sent Events) or 'ndjson'.",
         ),
     ) -> StreamingResponse:
-        if job_manager.get_job_status(job_id) is None:
+        if await job_manager.get_job_status_async(job_id) is None:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
         async def _event_generator() -> AsyncIterator[str]:
@@ -491,7 +491,7 @@ def create_app(
         },
     )
     async def download_job_zip(job_id: str) -> FileResponse:
-        status = job_manager.get_job_status(job_id)
+        status = await job_manager.get_job_status_async(job_id)
         if status is None:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
         if status.status == ConversionStage.FAILED:
@@ -505,7 +505,7 @@ def create_app(
                 detail=f"Job '{job_id}' is still in '{status.status.value}' stage ({status.percentage}%).",
             )
 
-        target = job_manager.get_download_target(job_id)
+        target = await job_manager.get_download_target_async(job_id)
         if target is None:
             raise HTTPException(status_code=404, detail=f"Output ZIP for job '{job_id}' is missing.")
         zip_path, filename, summary = target
@@ -533,7 +533,7 @@ def create_app(
         summary="Delete a conversion job and remove its stored artifacts",
     )
     async def delete_job(job_id: str) -> dict[str, Any]:
-        removed = job_manager.delete_job(job_id)
+        removed = await job_manager.delete_job_async(job_id)
         if not removed:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
         return {"job_id": job_id, "deleted": True}
@@ -605,7 +605,7 @@ def create_app(
         input_path = job_manager.job_dir(job_id) / f"input_{Path(orig_name).name}"
         await _save_upload_with_limit(file, input_path, max_bytes=cfg.max_upload_bytes)
 
-        job_manager.register_job(
+        await job_manager.register_job_async(
             job_id=job_id,
             input_path=input_path,
             original_filename=orig_name,
@@ -707,7 +707,7 @@ def create_app(
         job_id = job_manager.create_job_id()
         input_path = job_manager.job_dir(job_id) / f"input_{Path(orig_name).name}"
         await _save_upload_with_limit(file, input_path, max_bytes=cfg.max_upload_bytes)
-        job_manager.register_job(
+        await job_manager.register_job_async(
             job_id=job_id,
             input_path=input_path,
             original_filename=orig_name,
@@ -724,7 +724,7 @@ def create_app(
         except ArchiveError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        target = job_manager.get_download_target(job_id)
+        target = await job_manager.get_download_target_async(job_id)
         if target is None:
             raise HTTPException(status_code=500, detail="Converted output ZIP was not found.")
         zip_path, filename, _ = target

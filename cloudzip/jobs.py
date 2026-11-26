@@ -6,6 +6,7 @@ Copyright (c) 2026 Alexander Scott. All rights reserved.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import shutil
 import threading
@@ -31,6 +32,150 @@ from cloudzip.nvcomp_engine import NvcompCompressionEngine
 from cloudzip.pipeline import run_conversion_pipeline
 
 TERMINAL_STAGES = frozenset({ConversionStage.COMPLETED, ConversionStage.FAILED})
+
+_OFFLOAD_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="cloudzip-modal-io"
+)
+
+
+def _current_loop() -> asyncio.AbstractEventLoop | None:
+    """Return the loop running in *this* thread, if any."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+async def _run_modal_async(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Await a Modal handle operation without ever blocking the event loop.
+
+    Modal's synchronized handles expose an ``.aio`` twin for every method; when it
+    is available we await that so no ``AsyncUsageWarning`` is emitted. Handles that
+    do not provide ``.aio`` (fakes in tests, older Modal releases) are offloaded to
+    a worker thread so the loop still never blocks.
+    """
+    aio_fn = getattr(fn, "aio", None)
+    if aio_fn is not None:
+        return await aio_fn(*args, **kwargs)
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+def _run_modal_sync(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Call a blocking Modal handle method from sync code without triggering the warning.
+
+    Modal's ``AsyncUsageWarning`` fires when a blocking interface is used while an
+    event loop is running *in the calling thread*. If that is the case we hop onto a
+    dedicated worker thread (which has no loop) so the call stays legal.
+    """
+    if _current_loop() is None:
+        return fn(*args, **kwargs)
+    return _OFFLOAD_POOL.submit(fn, *args, **kwargs).result()
+
+
+class _ModalStateStore:
+    """Thin sync/async facade over the optional Modal Dict & Volume handles.
+
+    Worker threads use the blocking ``*`` methods; coroutines on the event loop use
+    the ``*_async`` methods, which prefer Modal's ``.aio`` interfaces.
+    """
+
+    def __init__(
+        self,
+        *,
+        dict_handle: Any | None = None,
+        volume_handle: Any | None = None,
+    ) -> None:
+        self._dict = dict_handle
+        self._volume = volume_handle
+
+    # ------------------------------------------------------------------ Dict
+    def put(self, key: str, value: dict[str, Any]) -> None:
+        if self._dict is None:
+            return
+        try:
+            _run_modal_sync(self._dict.put, key, value)
+        except Exception:
+            pass
+
+    async def put_async(self, key: str, value: dict[str, Any]) -> None:
+        if self._dict is None:
+            return
+        try:
+            await _run_modal_async(self._dict.put, key, value)
+        except Exception:
+            pass
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        if self._dict is None:
+            return None
+        try:
+            return _run_modal_sync(self._dict.get, key)
+        except Exception:
+            return None
+
+    async def get_async(self, key: str) -> dict[str, Any] | None:
+        if self._dict is None:
+            return None
+        try:
+            return await _run_modal_async(self._dict.get, key)
+        except Exception:
+            return None
+
+    def discard(self, key: str) -> bool:
+        """Remove `key` from the Dict; return True when an entry was removed."""
+        if self._dict is None:
+            return False
+        try:
+            if not _run_modal_sync(self._dict.contains, key):
+                return False
+            _run_modal_sync(self._dict.pop, key)
+            return True
+        except Exception:
+            return False
+
+    async def discard_async(self, key: str) -> bool:
+        if self._dict is None:
+            return False
+        try:
+            if not await _run_modal_async(self._dict.contains, key):
+                return False
+            await _run_modal_async(self._dict.pop, key)
+            return True
+        except Exception:
+            return False
+
+    # ---------------------------------------------------------------- Volume
+    def reload_volume(self) -> None:
+        if self._volume is None:
+            return
+        try:
+            _run_modal_sync(self._volume.reload)
+        except Exception:
+            pass
+
+    async def reload_volume_async(self) -> None:
+        if self._volume is None:
+            return
+        try:
+            await _run_modal_async(self._volume.reload)
+        except Exception:
+            pass
+
+    def commit_volume(self) -> None:
+        if self._volume is None:
+            return
+        try:
+            _run_modal_sync(self._volume.commit)
+        except Exception:
+            pass
+
+    async def commit_volume_async(self) -> None:
+        if self._volume is None:
+            return
+        try:
+            await _run_modal_async(self._volume.commit)
+        except Exception:
+            pass
 
 
 @dataclass
@@ -68,6 +213,7 @@ class JobManager:
         self._engine = engine
         self._modal_volume = modal_volume
         self._modal_dict = modal_dict
+        self._modal_store = _ModalStateStore(dict_handle=modal_dict, volume_handle=modal_volume)
         self._lock = threading.RLock()
         self._jobs: dict[str, _JobRuntimeState] = {}
 
@@ -78,8 +224,9 @@ class JobManager:
     def create_job_id(self) -> str:
         return uuid.uuid4().hex[:16]
 
-    def _persist_snapshot(self, state: _JobRuntimeState) -> None:
-        snapshot = {
+    @staticmethod
+    def _build_snapshot(state: _JobRuntimeState) -> dict[str, Any]:
+        return {
             "job_id": state.job_id,
             "created_at": state.created_at,
             "updated_at": state.updated_at,
@@ -92,8 +239,10 @@ class JobManager:
             "result": state.result.model_dump(mode="json") if state.result else None,
             "error": state.error,
         }
+
+    def _write_local_snapshot(self, snapshot: dict[str, Any]) -> None:
         try:
-            jdir = self.job_dir(state.job_id)
+            jdir = self.job_dir(snapshot["job_id"])
             jdir.mkdir(parents=True, exist_ok=True)
             state_file = jdir / "state.json"
             tmp_file = jdir / "state.json.tmp"
@@ -102,26 +251,19 @@ class JobManager:
         except Exception:
             pass
 
-        if self._modal_dict is not None:
-            try:
-                self._modal_dict[state.job_id] = snapshot
-            except Exception:
-                pass
+    def _persist_snapshot(self, state: _JobRuntimeState) -> None:
+        """Persist `state` from a worker thread (blocking Modal calls are safe here)."""
+        snapshot = self._build_snapshot(state)
+        self._write_local_snapshot(snapshot)
+        self._modal_store.put(state.job_id, snapshot)
 
-    def _load_remote_snapshot(self, job_id: str) -> dict[str, Any] | None:
-        if self._modal_dict is not None:
-            try:
-                if job_id in self._modal_dict:
-                    return dict(self._modal_dict[job_id])
-            except Exception:
-                pass
+    async def _persist_snapshot_async(self, state: _JobRuntimeState) -> None:
+        """Persist `state` from the event loop without blocking it."""
+        snapshot = self._build_snapshot(state)
+        await asyncio.to_thread(self._write_local_snapshot, snapshot)
+        await self._modal_store.put_async(state.job_id, snapshot)
 
-        if self._modal_volume is not None:
-            try:
-                self._modal_volume.reload()
-            except Exception:
-                pass
-
+    def _read_local_snapshot(self, job_id: str) -> dict[str, Any] | None:
         state_file = self.job_dir(job_id) / "state.json"
         if state_file.exists():
             try:
@@ -130,14 +272,29 @@ class JobManager:
                 return None
         return None
 
-    def register_job(
+    def _load_remote_snapshot(self, job_id: str) -> dict[str, Any] | None:
+        """Blocking snapshot lookup — only call from worker threads."""
+        remote = self._modal_store.get(job_id)
+        if remote is not None:
+            return dict(remote)
+        self._modal_store.reload_volume()
+        return self._read_local_snapshot(job_id)
+
+    async def _load_remote_snapshot_async(self, job_id: str) -> dict[str, Any] | None:
+        """Snapshot lookup that is safe to await on the event loop."""
+        remote = await self._modal_store.get_async(job_id)
+        if remote is not None:
+            return dict(remote)
+        await self._modal_store.reload_volume_async()
+        return await asyncio.to_thread(self._read_local_snapshot, job_id)
+
+    def _new_state(
         self,
         *,
         job_id: str,
         input_path: Path,
         original_filename: str,
     ) -> _JobRuntimeState:
-        self.cleanup_expired_jobs()
         now_iso = datetime.now(timezone.utc).isoformat()
         jdir = self.job_dir(job_id)
         jdir.mkdir(parents=True, exist_ok=True)
@@ -151,7 +308,7 @@ class JobManager:
             backend=self._engine.active_backend,
             timestamp=now_iso,
         )
-        state = _JobRuntimeState(
+        return _JobRuntimeState(
             job_id=job_id,
             created_at=now_iso,
             updated_at=now_iso,
@@ -164,9 +321,42 @@ class JobManager:
             original_filename=original_filename,
             events=[initial_event],
         )
+
+    def register_job(
+        self,
+        *,
+        job_id: str,
+        input_path: Path,
+        original_filename: str,
+    ) -> _JobRuntimeState:
+        self.cleanup_expired_jobs()
+        state = self._new_state(
+            job_id=job_id,
+            input_path=input_path,
+            original_filename=original_filename,
+        )
         with self._lock:
             self._jobs[job_id] = state
-            self._persist_snapshot(state)
+        self._persist_snapshot(state)
+        return state
+
+    async def register_job_async(
+        self,
+        *,
+        job_id: str,
+        input_path: Path,
+        original_filename: str,
+    ) -> _JobRuntimeState:
+        """Async twin of `register_job` that never blocks the event loop on Modal I/O."""
+        await self.cleanup_expired_jobs_async()
+        state = self._new_state(
+            job_id=job_id,
+            input_path=input_path,
+            original_filename=original_filename,
+        )
+        with self._lock:
+            self._jobs[job_id] = state
+        await self._persist_snapshot_async(state)
         return state
 
     def emit_event(self, job_id: str, event: ProgressEvent) -> None:
@@ -184,7 +374,10 @@ class JobManager:
                 state.error = event.error
             state.events.append(event)
             subs = list(state.subscribers)
-            self._persist_snapshot(state)
+            snapshot = self._build_snapshot(state)
+
+        self._write_local_snapshot(snapshot)
+        self._modal_store.put(job_id, snapshot)
 
         for loop, queue in subs:
             try:
@@ -222,11 +415,7 @@ class JobManager:
             )
             # Remove uploaded input archive once output ZIP is finalized to save disk space
             input_path.unlink(missing_ok=True)
-            if self._modal_volume is not None:
-                try:
-                    self._modal_volume.commit()
-                except Exception:
-                    pass
+            self._modal_store.commit_volume()
             return summary
         except (ArchivePasswordError, ArchiveError, ValueError) as exc:
             err_msg = str(exc)
@@ -277,32 +466,50 @@ class JobManager:
     def get_job_status(self, job_id: str) -> JobStatusResponse | None:
         with self._lock:
             state = self._jobs.get(job_id)
-            if state is not None:
-                ready = (
-                    state.status == ConversionStage.COMPLETED and state.output_zip_path.exists()
-                )
-                return JobStatusResponse(
-                    job_id=state.job_id,
-                    status=state.status,
-                    percentage=state.percentage,
-                    message=state.message,
-                    created_at=state.created_at,
-                    updated_at=state.updated_at,
-                    download_ready=ready,
-                    download_url=f"/api/v1/jobs/{job_id}/download" if ready else None,
-                    result=state.result,
-                    error=state.error,
-                )
+        if state is not None:
+            return self._status_from_state(state)
 
         remote = self._load_remote_snapshot(job_id)
         if remote is None:
             return None
+        return self._status_from_snapshot(remote)
+
+    async def get_job_status_async(self, job_id: str) -> JobStatusResponse | None:
+        """Async twin of `get_job_status` that never blocks the event loop on Modal I/O."""
+        with self._lock:
+            state = self._jobs.get(job_id)
+        if state is not None:
+            return self._status_from_state(state)
+
+        remote = await self._load_remote_snapshot_async(job_id)
+        if remote is None:
+            return None
+        return self._status_from_snapshot(remote)
+
+    def _status_from_state(self, state: _JobRuntimeState) -> JobStatusResponse:
+        with self._lock:
+            ready = state.status == ConversionStage.COMPLETED and state.output_zip_path.exists()
+            return JobStatusResponse(
+                job_id=state.job_id,
+                status=state.status,
+                percentage=state.percentage,
+                message=state.message,
+                created_at=state.created_at,
+                updated_at=state.updated_at,
+                download_ready=ready,
+                download_url=f"/api/v1/jobs/{state.job_id}/download" if ready else None,
+                result=state.result,
+                error=state.error,
+            )
+
+    def _status_from_snapshot(self, remote: dict[str, Any]) -> JobStatusResponse:
+        job_id = remote["job_id"]
         status_enum = ConversionStage(remote["status"])
         out_path = Path(remote["output_zip_path"])
         ready = status_enum == ConversionStage.COMPLETED and out_path.exists()
         res_obj = JobResultSummary.model_validate(remote["result"]) if remote.get("result") else None
         return JobStatusResponse(
-            job_id=remote["job_id"],
+            job_id=job_id,
             status=status_enum,
             percentage=float(remote["percentage"]),
             message=remote["message"],
@@ -317,32 +524,57 @@ class JobManager:
     def get_download_target(self, job_id: str) -> tuple[Path, str, JobResultSummary | None] | None:
         with self._lock:
             state = self._jobs.get(job_id)
-            if state is not None and state.status == ConversionStage.COMPLETED:
-                if state.output_zip_path.exists():
-                    fname = (
-                        state.result.output_filename
-                        if state.result
-                        else f"{state.job_id}.zip"
-                    )
-                    return state.output_zip_path, fname, state.result
+        if state is not None:
+            target = self._download_target_from_state(state)
+            if target is not None:
+                return target
 
         remote = self._load_remote_snapshot(job_id)
         if remote and remote.get("status") == ConversionStage.COMPLETED.value:
-            if self._modal_volume is not None:
-                try:
-                    self._modal_volume.reload()
-                except Exception:
-                    pass
-            out_path = Path(remote["output_zip_path"])
-            if out_path.exists():
-                res_obj = (
-                    JobResultSummary.model_validate(remote["result"])
-                    if remote.get("result")
-                    else None
-                )
-                fname = res_obj.output_filename if res_obj else f"{job_id}.zip"
-                return out_path, fname, res_obj
+            self._modal_store.reload_volume()
+            return self._download_target_from_snapshot(job_id, remote)
         return None
+
+    async def get_download_target_async(
+        self, job_id: str
+    ) -> tuple[Path, str, JobResultSummary | None] | None:
+        """Async twin of `get_download_target` that never blocks the event loop."""
+        with self._lock:
+            state = self._jobs.get(job_id)
+        if state is not None:
+            target = self._download_target_from_state(state)
+            if target is not None:
+                return target
+
+        remote = await self._load_remote_snapshot_async(job_id)
+        if remote and remote.get("status") == ConversionStage.COMPLETED.value:
+            await self._modal_store.reload_volume_async()
+            return self._download_target_from_snapshot(job_id, remote)
+        return None
+
+    def _download_target_from_state(
+        self, state: _JobRuntimeState
+    ) -> tuple[Path, str, JobResultSummary | None] | None:
+        with self._lock:
+            if state.status != ConversionStage.COMPLETED:
+                return None
+            if not state.output_zip_path.exists():
+                return None
+            fname = state.result.output_filename if state.result else f"{state.job_id}.zip"
+            return state.output_zip_path, fname, state.result
+
+    @staticmethod
+    def _download_target_from_snapshot(
+        job_id: str, remote: dict[str, Any]
+    ) -> tuple[Path, str, JobResultSummary | None] | None:
+        out_path = Path(remote["output_zip_path"])
+        if not out_path.exists():
+            return None
+        res_obj = (
+            JobResultSummary.model_validate(remote["result"]) if remote.get("result") else None
+        )
+        fname = res_obj.output_filename if res_obj else f"{job_id}.zip"
+        return out_path, fname, res_obj
 
     async def subscribe_events(self, job_id: str) -> AsyncIterator[ProgressEvent]:
         """Yield historical and live ProgressEvents for `job_id` until a terminal stage is reached."""
@@ -380,7 +612,7 @@ class JobManager:
         # Cross-replica fallback via Modal Dict / Volume polling
         seen_count = 0
         while True:
-            snap = self._load_remote_snapshot(job_id)
+            snap = await self._load_remote_snapshot_async(job_id)
             if snap is None:
                 return
             raw_events = snap.get("events", [])
@@ -392,7 +624,8 @@ class JobManager:
                     return
             await asyncio.sleep(0.25)
 
-    def delete_job(self, job_id: str) -> bool:
+    def _forget_local_job(self, job_id: str) -> bool:
+        """Drop in-memory + on-disk job artifacts; return True if anything existed."""
         existed = False
         with self._lock:
             if job_id in self._jobs:
@@ -402,30 +635,46 @@ class JobManager:
         if jdir.exists():
             shutil.rmtree(jdir, ignore_errors=True)
             existed = True
-        if self._modal_dict is not None:
-            try:
-                if job_id in self._modal_dict:
-                    del self._modal_dict[job_id]
-                    existed = True
-            except Exception:
-                pass
-        if existed and self._modal_volume is not None:
-            try:
-                self._modal_volume.commit()
-            except Exception:
-                pass
         return existed
 
-    def cleanup_expired_jobs(self) -> int:
+    def delete_job(self, job_id: str) -> bool:
+        existed = self._forget_local_job(job_id)
+        if self._modal_store.discard(job_id):
+            existed = True
+        if existed:
+            self._modal_store.commit_volume()
+        return existed
+
+    async def delete_job_async(self, job_id: str) -> bool:
+        """Async twin of `delete_job` that never blocks the event loop on Modal I/O."""
+        existed = await asyncio.to_thread(self._forget_local_job, job_id)
+        if await self._modal_store.discard_async(job_id):
+            existed = True
+        if existed:
+            await self._modal_store.commit_volume_async()
+        return existed
+
+    def _expired_job_ids(self) -> list[str]:
         ttl = self._settings.job_ttl_seconds
         now = time.monotonic()
-        expired_ids: list[str] = []
         with self._lock:
-            for jid, st in self._jobs.items():
-                if st.status in TERMINAL_STAGES and (now - st.created_monotonic) > ttl:
-                    expired_ids.append(jid)
+            return [
+                jid
+                for jid, st in self._jobs.items()
+                if st.status in TERMINAL_STAGES and (now - st.created_monotonic) > ttl
+            ]
+
+    def cleanup_expired_jobs(self) -> int:
+        expired_ids = self._expired_job_ids()
         for jid in expired_ids:
             self.delete_job(jid)
+        return len(expired_ids)
+
+    async def cleanup_expired_jobs_async(self) -> int:
+        """Async twin of `cleanup_expired_jobs` that never blocks the event loop."""
+        expired_ids = self._expired_job_ids()
+        for jid in expired_ids:
+            await self.delete_job_async(jid)
         return len(expired_ids)
 
 
