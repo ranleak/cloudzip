@@ -25,7 +25,7 @@ GPU_SPEC = os.environ.get("CLOUDZIP_GPU", "L4")
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("ubuntu:24.04", add_python="3.12")
     .apt_install(
         "libarchive-tools",
         "libarchive-dev",
